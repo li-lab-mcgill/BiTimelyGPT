@@ -1,3 +1,4 @@
+import os
 import time
 import numpy as np
 from models.BiTimelyGPT import BiTimelyGPT
@@ -6,11 +7,11 @@ import torch.optim as optim
 import torch
 from torch import nn
 import random
-from data import data_provider  # Importing data_provider from dataset package
-
+from data.data_pipeline import data_pipeline
+from layers.optimization import *
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='BiTimelyGPT for pretraining PopHR irregularly-sampled time series')
+    parser = argparse.ArgumentParser(description='BiTimelyGPT for pretraining (continuously) biosignals')
 
     # random seed
     parser.add_argument('--random_seed', type=int, default=2021, help='random seed')
@@ -19,12 +20,25 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, default=1, help='status')
     parser.add_argument('--model', type=str, default='BiTimelyGPT', help='model name, options: [BiTimelyGPT]')
 
-    # dataset loader
+
+    # dataset_small loader
     parser.add_argument('--root_path', type=str, default='./data/', help='root path of the data file')
-    parser.add_argument('--data_file', type=str, default='processed_pophr_data.csv', help='data file')
+    parser.add_argument('--data_folder', type=str, default='sleepEDF', help='data file')
+    parser.add_argument('--features', type=str, default='M',
+                        help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
+    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 
+    # forecasting task
+    parser.add_argument('--n_output', type=int, default=1, help='number of variates')
+    parser.add_argument('--seq_len', type=int, default=4096, help='input sequence length')
+    parser.add_argument('--label_len', type=int, default=128, help='start token length')
+    parser.add_argument('--pred_len', type=int, default=1024, help='prediction sequence length')
+
     # the hyperparameters for BiTimelyGPT
+    # parser.add_argument('--patch_len', type=int, default=1, help='patch length')
+    # parser.add_argument('--stride', type=int, default=1, help='stride')
+    # parser.add_argument('--padding_patch', default='end', help='None: None; end: padding on the end')
     parser.add_argument('--num_heads', type=int, default=4, help='num of heads')
     parser.add_argument('--num_layers', type=int, default=4, help='num of decoder layers')
     parser.add_argument('--d_model', type=int, default=200, help='dimension of model')
@@ -34,6 +48,7 @@ if __name__ == '__main__':
     parser.add_argument('--forward_impl', type=str, default='chunkwise',
                         help='forward implementation, options:[parallel, recurrent, chunkwise]')
     parser.add_argument('--chunk_size', type=int, default=512, help='chunk size')
+    parser.add_argument('--d_ff', type=int, default=144*2, help='dimension of feed-forward layer')
     parser.add_argument('--use_bias_in_msr', type=bool, default=False, help='Use bias in MSR')
     parser.add_argument('--use_bias_in_mlp', type=bool, default=True, help='Use bias in feed-forward layer')
     parser.add_argument('--use_bias_in_msr_out', type=bool, default=False, help='Use bias in MSR output layer')
@@ -84,7 +99,7 @@ if __name__ == '__main__':
         args.gpu = args.device_ids[0]
     device = torch.device('cuda:{}'.format(args.gpu))
 
-    model = BiTimelyGPT(configs=args).to(device=device)
+    model = BiTimelyGPT(configs=args, head_type='pretrain').to(device=device)
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('Total params: {}'.format(pytorch_total_params))
 
@@ -92,39 +107,42 @@ if __name__ == '__main__':
 
     # Pre-training stage
     print("Pre-training Stage")
-    train_dataset, train_dataloader, valid_dataset, valid_dataloader, test_dataset, test_dataloader = data_provider(args.batch_size, max_length=256)
+
+    # Concatenate root_path and data_folder to form the full data path
+    data_path = os.path.join(args.root_path, args.data_folder)
+    pretrain_data, pretrain_loader = data_pipeline(data_path, flag='pre_train')
+    vali_data, vali_loader = data_pipeline(data_path, flag='val')
+
+    train_epochs = 20
+    num_training_steps = len(pretrain_loader) * train_epochs
+    num_warmup_steps = num_training_steps * 0.05
+    scheduler = get_linear_schedule_with_warmup(model_optim, num_warmup_steps, num_training_steps)
 
     train_loss = []
-    train_epochs = 20
+    valid_loss = []
     for epoch in range(train_epochs):
+        print('Epoch: {}'.format(epoch))
         # pre-train the model
         model.train()
-        for i, (batch_x, batch_t) in enumerate(train_dataloader):
-            batch_x = batch_x.to(device)
-            batch_t = batch_t.to(device)
+        for i, (batch_x, batch_y) in enumerate(pretrain_loader):
+            print("mini-batch number: ", i, " of ", len(pretrain_loader), " mini-batches.")
+            batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device) # no label for pre-training
             model_optim.zero_grad()
-            loss = model(X=batch_x, t=batch_t, y=batch_x)
+            loss = model(batch_x, batch_y, forward_impl=args.forward_impl, chunk_size=args.chunk_size)
             loss.backward()
             model_optim.step()
             train_loss.append(loss.item())
         print('epoch: {}, train_loss: {}'.format(epoch, np.mean(train_loss)))
-        # select the best model during pre-training
+
         model.eval()
         valid_loss = []
         with torch.no_grad():
-            for i, (batch_x, batch_t) in enumerate(valid_dataloader):
-                batch_x = batch_x.to(device)
-                batch_t = batch_t.to(device)
-                loss = model(X=batch_x, t=batch_t, y=batch_x)
+            for i, (batch_x, batch_y) in enumerate(vali_loader):
+                print("mini-batch number: ", i, " of ", len(vali_loader), " mini-batches.")
+                batch_x = batch_x.float().to(device)
+                batch_y = batch_y.float().to(device)
+                loss = model(batch_x, batch_y, forward_impl=args.forward_impl, chunk_size=args.chunk_size)
                 valid_loss.append(loss.item())
             print('epoch: {}, valid_loss: {}'.format(epoch, np.mean(valid_loss)))
-        # no need for pre-training stage
-        # model.eval()
-        # test_loss = []
-        # with torch.no_grad():
-        #     for i, (batch_x, batch_t)  in enumerate(test_dataloader):
-        #         batch_x = batch_x.to(device)
-        #         batch_t = batch_t.to(device)
-        #         loss = model(X=batch_x, t=batch_t, y=batch_x)
-        #         test_loss.append(loss.item())
-        #     print('epoch: {}, test_loss: {}'.format(epoch, np.mean(test_loss)))
+

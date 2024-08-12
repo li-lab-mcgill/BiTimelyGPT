@@ -4,8 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
-# from layers.Retention_layers import RetNetBlock
-from layers.Retention_ISTS_layers import RetNetBlock
+from layers.BiTimelyGPT_ISTS_layers import RetNetBlock
 from layers.heads import *
 from layers.Embed import TokenEmbeddingFixed
 from layers.snippets import get_gpu_memory_usage, SigmoidRange
@@ -37,11 +36,6 @@ class BiTimelyGPT(nn.Module):
         self.eos = torch.nn.Parameter(torch.zeros(self.d_model))
         nn.init.normal_(self.eos)
 
-        # Integration of ConvSubampling for embedding, optional for ISTS data
-        # self.conv_subsampling = Conv1dSubampling_new(in_channels=self.c_in, out_channels=self.d_model, reduce_time_layers=2)
-        # Add ConvUpampling for upsampling, note that the argument intermediate_channels is not used
-        # self.conv_upsampling = Conv1dUpsampling(hidden_dim=self.d_model, reduce_time_layers=2)
-
         # the stacked decoder layer
         self.blocks = nn.ModuleList([RetNetBlock(configs) for _ in range(self.num_layers)])
 
@@ -50,7 +44,7 @@ class BiTimelyGPT(nn.Module):
         self.head_type = head_type
         if self.head_type == "pretrain":
             self.n_output = self.token_embedding.get_num_tokens()  # Update n_output to the number of unique PheCodes
-            self.head = PretrainHead(self.d_model, self.n_output) # the token is [batch_size x seq_len x c_in]
+            self.head = PretrainHead(self.d_model, self.n_output) # the token is [batch_size x seq_len x n_output]
         elif self.head_type == "clf":
             self.n_output = n_output # Update the number of output classes
             self.head = ClfHead(self.d_model, self.n_output)
@@ -74,7 +68,6 @@ class BiTimelyGPT(nn.Module):
         for i in range(batch_size):
             # Use token_embedding to get embeddings for the entire sequence for batch i
             hidden_states[i] = self.token_embedding(X[i])
-
 
         # Add the SOS token to the input sequence
         # sos_token = self.sos.unsqueeze(0).repeat(batch_size, 1, 1)  # Shape [batch_size, 1, d_model]
